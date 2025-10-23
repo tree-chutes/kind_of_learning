@@ -1,6 +1,5 @@
 // Copyright (c) 2025, tree-chutes
 
-#![feature(vec_into_raw_parts)]
 #![feature(downcast_unchecked)]
 #![allow(non_snake_case)]
 mod mlp;
@@ -13,7 +12,7 @@ use co5_backflow_public::{
     workunit::WorkUnit,
 };
 use mlp::{
-    layers::{Layers, layer_factory},
+    layers::{Layer, Layers, layer_factory},
     loss_functions::{LossFunctions, loss_function_factory},
     register::REGISTER_WIDTH,
 };
@@ -52,9 +51,20 @@ pub fn authorize(_t: &str) -> Result<bool, CO5AuthorizationError> {
 }
 
 #[unsafe(no_mangle)]
-pub fn rest_workflow() -> Vec<StageDescriptor> {
+pub fn nn_workflow() -> Vec<StageDescriptor> {
     let mut s = Vec::<StageDescriptor>::new();
-    let s1: StageDescriptor = StageDescriptor { full_time_agents: 10, part_time_agents: 5, task: Some(full_pass), ctask: None, c_free_memory: None, agents_pause: 10, master_pause: 25, work_in_progress: 5, label: "FULL PASS".to_string(), logging: true};
+    let s1: StageDescriptor = StageDescriptor {
+        full_time_agents: 10,
+        part_time_agents: 5,
+        task: Some(full_pass),
+        ctask: None,
+        c_free_memory: None,
+        agents_pause: 10,
+        master_pause: 25,
+        work_in_progress: 5,
+        label: "FULL PASS".to_string(),
+        logging: true,
+    };
     s.push(s1);
     return s;
 }
@@ -67,6 +77,7 @@ fn full_pass(mut wu: WorkUnit) -> WorkUnit {
     let bias: Vec<f64> = vec![];
     let p_s = (0 as u16, 1 as u16);
     let vectors: &mut Vectors<f64> = wu.custom_struct.downcast_mut().expect("msg");
+    let mut layers: Vec<(Box<dyn Layer<f64>>, &mut [f64], &[f64])> = vec![];
     let ret: Arc<Vec<u8>>;
 
     unsafe {
@@ -89,13 +100,7 @@ fn full_pass(mut wu: WorkUnit) -> WorkUnit {
     );
 
     conv_layer_0.set_first_layer_flag(); //this skips the second convolution if it isnot needed
-
-    let forward_conv_0 = (
-        vectors.input.as_slice(),
-        vectors.conv_0_weights.as_mut_slice(),
-        bias.as_slice(),
-    );
-    let mut z_conv_0: Vec<f64> = conv_layer_0.forward(forward_conv_0, None);
+    layers.push((conv_layer_0, vectors.conv_0_weights.as_mut_slice(), &bias));
 
     let conv_layer_1 = layer_factory::<f64>(
         Layers::Conv2D,
@@ -106,61 +111,90 @@ fn full_pass(mut wu: WorkUnit) -> WorkUnit {
         0.0,
     );
 
-    let forward_conv_1 = (
-        z_conv_0.as_slice(),
-        vectors.conv_1_weights.as_mut_slice(),
-        bias.as_slice(),
-    );
-
-    let mut z_conv_1: Vec<f64> = conv_layer_1.forward(forward_conv_1, None);
+    layers.push((conv_layer_1, vectors.conv_1_weights.as_mut_slice(), &bias));
 
     let linear_layer =
         layer_factory::<f64>(Layers::Linear, 1, linear_weights_len, 1, Some(p_s), 0.0);
 
-    let forward_linear = (
-        z_conv_1.as_slice(),
-        vectors.linear_weights.as_mut_slice(),
-        bias.as_slice(),
-    );
+    layers.push((linear_layer, vectors.linear_weights.as_mut_slice(), &bias));
 
-    let z_linear: Vec<f64> = linear_layer.forward(forward_linear, None);
+    //FORWARD PASS
+    let mut z: Vec<Vec<f64>> = network_forward(layers.as_mut_slice(), &vectors.input);
 
+    //LOSS STEP
+    let count = z.len();
     let (flat_loss, squared) =
         loss_function_factory(LossFunctions::MeanSquares, vec![vec![2.0]], 1.0);
-    let loss = squared.forward(&flat_loss, &z_linear);
-    let mut from_loss_to_linear_grads = squared.backward(z_linear[0], z_conv_1.as_mut_slice());
-    let linear_backward = (
-        from_loss_to_linear_grads.as_mut_slice(),
-        vectors.linear_weights.as_mut_slice(),
-        z_conv_1.as_mut_slice(),
+    let _loss = squared.forward(&flat_loss, &z[z.len() - 1]);
+    let from_loss_to_linear_grads =
+        squared.backward(z[count - 1][0], z[count - 2].as_mut_slice());
+    let d_loss = z.pop().unwrap()[0];
+
+    //Backward pass can be executed in another endpoint since it does require more
+    //computations. Layers are stateless and lightweight. Just load the bytes in the payload 
+    //return the data or daisy chain service calls
+    let success = network_backward(
+        layers,
+        from_loss_to_linear_grads,
+        z,
+        0.01,
+        d_loss
+
     );
-
-    let (mut from_linear_to_conv_1_grads, _dummy_bias) =
-        linear_layer.backward(linear_backward, 0.01, z_linear[0]);
-
-    let conv_1_backward = (
-        z_conv_0.as_mut_slice(),
-        from_linear_to_conv_1_grads.as_mut_slice(),
-        vectors.conv_1_weights.as_mut_slice(),
-    );
-
-    let mut from_conv_1_to_conv_0_grads: Vec<f64>;
-    (vectors.conv_1_weights, from_conv_1_to_conv_0_grads) =
-        conv_layer_1.backward(conv_1_backward, 0.01, 0.0);
-
-    let conv_0_backward = (
-        vectors.input.as_mut_slice(),
-        from_conv_1_to_conv_0_grads.as_mut_slice(),
-        vectors.conv_0_weights.as_mut_slice(),
-    );
-
-    let _dummy: Vec<f64>;
-    (vectors.conv_0_weights, _dummy) = conv_layer_0.backward(conv_0_backward, 0.01, 0.0);
-    ret = Arc::new(write_payload(&vectors.input, &vectors.conv_0_weights, &vectors.conv_1_weights, &vectors.linear_weights, loss[0]));
-    wu.payload_size = ret.len() as u32;
-    wu.payload = Some(ret);
     wu.done = true;
     wu
+}
+
+fn network_forward(
+    layers: &mut [(Box<dyn Layer<f64>>, &mut [f64], &[f64])],
+    input_layer: &[f64],
+) -> Vec<Vec<f64>> {
+    let mut counter = 0;
+    let mut ret: Vec<Vec<f64>> = vec![];
+    ret.push(input_layer.to_vec());
+    let mut current_input = input_layer;
+    
+    loop {
+        ret.push(
+            layers[counter]
+                .0
+                .forward((current_input, layers[counter].1, layers[counter].2), None),
+        );
+        current_input = &ret[ret.len() - 1];
+        counter += 1;
+
+        if counter == layers.len() {
+            break;
+        }
+    }
+    ret
+}
+
+fn network_backward(
+    mut layers: Vec<(Box<dyn Layer<f64>>, &mut [f64], &[f64])>,
+    loss_gradient: Vec<f64>,
+    mut z: Vec<Vec<f64>>,
+    learning_rate: f64,
+    d_loss: f64
+) -> Vec<Vec<f64>> {
+    let mut idx = layers.len();
+    let mut updated_weights: Vec<Vec<f64>> = vec![vec![]; layers.len()];
+    //It is a regression, linear layer
+    let mut current_gradient = loss_gradient;
+    let (layer, weights, _bias) = layers.pop().unwrap();
+    let mut z_previous = z.pop().unwrap();
+    (current_gradient, _) = layer.backward((current_gradient.as_mut_slice(), weights, z_previous.as_mut_slice()), learning_rate, d_loss);
+    idx -= 1;
+    updated_weights[idx] = weights.to_vec();
+    while layers.len() > 0 {
+        let (layer, weights, _bias) = layers.pop().unwrap();
+        z_previous = z.pop().unwrap();
+        let (updated, back) = layer.backward((z_previous.as_mut_slice(), current_gradient.as_mut_slice(), weights), learning_rate, d_loss);
+        idx -= 1;
+        updated_weights[idx] = updated;
+        current_gradient = back;
+    }
+    updated_weights
 }
 
 fn read_payload(payload: &[u8], vectors: &mut Vectors<f64>) -> (usize, usize, usize, usize) {
