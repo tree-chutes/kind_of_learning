@@ -29,30 +29,13 @@ unsafe extern "C" {
 
 pub(super) struct MeanSquares<F: Float> {
     pub(super) one: F,
-    pub(super) n: usize,
-    pub(super) m: usize,
+    pub(super) len: usize,
 }
 
 impl<F: Float> Loss<F> for MeanSquares<F> {
-    fn flatten(&mut self, mut t: Vec<Vec<F>>) -> Vec<F> {
-        assert!(t.len() != 0);
-        assert!(t[0].len() != 0);
-        let mut ret: Vec<F> = vec![];
-        let check = t[0].len();
-
-        if self.n == 0 {
-            self.n = t.len();
-            self.m = check;
-        } else {
-            assert!(self.n == t.len());
-            assert!(self.m == check);
-        }
-        for idx in 0..t.len() {
-            if t[idx].len() != check {
-                panic!("Truth out of shape: {}", idx)
-            }
-            ret.append(&mut t[idx]);
-        }
+    fn resize(&self, t: Vec<F>) -> Vec<F> {
+        assert!(t.len() == self.len);
+        let mut ret: Vec<F> = t;
         ret.resize(
             ret.len() + (REGISTER_WIDTH / (size_of::<F>() * 8)) - ret.len() % (REGISTER_WIDTH / (size_of::<F>() * 8)),
             self.one - self.one,
@@ -61,15 +44,15 @@ impl<F: Float> Loss<F> for MeanSquares<F> {
     }
 
     fn forward(&self, t: &[F], p: &[F]) -> Vec<F> {
-        let truth_len: usize = self.n * self.m + (REGISTER_WIDTH / (size_of::<F>() * 8))
-            - self.n * self.m % (REGISTER_WIDTH / (size_of::<F>() * 8));
+        let truth_len: usize = self.len + (REGISTER_WIDTH / (size_of::<F>() * 8))
+            - self.len % (REGISTER_WIDTH / (size_of::<F>() * 8));
         assert!(t.len() == truth_len);
         assert!(p.len() == truth_len);
         self.execute_forward(t, p)
     }
 
-    fn backward(&self, loss: F, dl: &mut [F])-> Vec<F>{
-        self.execute_backward(loss,dl)
+    fn backward(&self, loss: &[F], dl: &mut [F])-> Vec<F>{
+        self.execute_backward(loss[0],dl)
     }
 }
 
@@ -105,7 +88,7 @@ impl<F: Float> MeanSquares<F> {
 
     fn execute_forward(&self, t: &[F], p: &[F]) -> Vec<F> {
         let zero = self.one - self.one;
-        let total = self.n * self.m;
+        let total = self.len;
         let ret: Vec<F> = vec![zero; total];
         unsafe {
             if size_of::<F>() == 8 {
